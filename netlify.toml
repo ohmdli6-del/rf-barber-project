@@ -1,0 +1,10 @@
+[build]
+  functions = "netlify/functions"
+
+[functions."send-reminders"]
+  schedule = "0 14 * * *"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
