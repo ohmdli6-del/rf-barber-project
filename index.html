@@ -808,25 +808,51 @@ async function storSet(key, val){
 }
 async function sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
 
-// Rezervasiyanı təhlükəsiz şəkildə yazır: eyni anda gələn rezervasiyaların bir-birini
-// "əzib" itirməsinin qarşısını almaq üçün yazandan sonra yoxlayır, lazım olsa təkrar cəhd edir.
+/* ============================================================
+   BOOKINGS — öz cədvəlindən (hər rezervasiya öz sətri)
+   kv_store-dakı köhnə "bütün massivi oxu-dəyiş-yaz" üsulunun
+   yerinə keçdi. Bax: supabase_bookings_migration.sql
+   ============================================================ */
+function bookingToRow(b){
+  return {
+    id: b.id, date: b.date, time: b.time,
+    barber_id: b.barberId, barber_name: b.barberName,
+    service_id: b.serviceId, service_name: b.serviceName,
+    cat: b.cat, name: b.name, phone: b.phone,
+    reminded: false, created_at: b.createdAt
+  };
+}
+function rowToBooking(r){
+  return {
+    id: r.id, date: r.date, time: r.time,
+    barberId: r.barber_id, barberName: r.barber_name,
+    serviceId: r.service_id, serviceName: r.service_name,
+    cat: r.cat, name: r.name, phone: r.phone,
+    reminded: r.reminded, createdAt: r.created_at
+  };
+}
+async function fetchBookings(){
+  if(!backendReady()) return [];
+  const { data, error } = await sb.from('bookings').select('*').order('date').order('time');
+  if(error){ console.error('fetchBookings error', error); return []; }
+  return data.map(rowToBooking);
+}
+
+// Rezervasiyanı ayrıca sətir kimi əlavə edir. Cədvəldəki
+// unique(date,time,barber_id) qıfılı sayəsində eyni vaxta iki
+// rezervasiya fiziki olaraq yazıla bilmir — verilənlər bazası
+// bunu özü rədd edir (23505 xətası), tətbiq kodunun bunu əvvəlcədən
+// "yoxlayıb sonra yazması" arasında artıq boşluq (race condition) yoxdur.
 async function addBookingSafely(booking){
-  for(let attempt=0; attempt<4; attempt++){
-    const current = await storGet('bookings') || [];
-    const clash = current.some(b=> b.date===booking.date && b.time===booking.time && b.barberId===booking.barberId);
-    if(clash) return { ok:false, reason:'taken' };
-
-    const next = [...current, booking];
-    await storSet('bookings', next);
-
-    const verify = await storGet('bookings') || [];
-    if(verify.some(b=>b.id===booking.id)){
-      bookings = verify;
-      return { ok:true };
-    }
-    await sleep(250 + Math.random()*350);
+  if(!backendReady()) return { ok:false, reason:'error' };
+  const { error } = await sb.from('bookings').insert(bookingToRow(booking));
+  if(error){
+    if(error.code === '23505') return { ok:false, reason:'taken' };
+    console.error('booking insert failed', error);
+    return { ok:false, reason:'error' };
   }
-  return { ok:false, reason:'error' };
+  bookings = await fetchBookings();
+  return { ok:true };
 }
 
 function setupQr(){
@@ -865,8 +891,7 @@ async function init(){
   hours = await storGet('hours');
   if(!hours){ hours = DEFAULT_HOURS; await storSet('hours', hours); }
 
-  bookings = await storGet('bookings');
-  if(!bookings){ bookings = []; await storSet('bookings', bookings); }
+  bookings = await fetchBookings();
   await pruneOldBookings(); // köhnə (bugünkü tarixdən əvvəlki) rezervasiyaları avtomatik təmizlə
 
   let pass = await storGet('admin_password');
@@ -1330,14 +1355,12 @@ function inferBookingCat(b){
 }
 
 async function pruneOldBookings(){
-  const all = await storGet('bookings') || [];
+  if(!backendReady()) return bookings;
   const todayStr = localDateStr(new Date());
-  const kept = all.filter(b=> b.date >= todayStr);
-  if(kept.length !== all.length){
-    await storSet('bookings', kept);
-  }
-  bookings = kept;
-  return kept;
+  const { error } = await sb.from('bookings').delete().lt('date', todayStr);
+  if(error) console.error('pruneOldBookings error', error);
+  bookings = await fetchBookings();
+  return bookings;
 }
 
 function bookingRowHTML(b){
@@ -1394,9 +1417,9 @@ async function renderAdminBookings(){
   groupsEl.innerHTML = html;
 }
 async function deleteBooking(id){
-  bookings = await storGet('bookings') || [];
-  bookings = bookings.filter(b=>b.id!==id);
-  await storSet('bookings', bookings);
+  const { error } = await sb.from('bookings').delete().eq('id', id);
+  if(error) console.error('deleteBooking error', error);
+  bookings = await fetchBookings();
   renderAdminBookings();
   renderSlots();
   renderLazerSlots();
@@ -1418,8 +1441,8 @@ async function openCancelModal(bookingId){
   overlay.classList.add('show');
   content.innerHTML = '<p style="color:var(--muted);">Yüklənir...</p>';
 
-  const all = await storGet('bookings') || [];
-  const booking = all.find(b=>b.id===bookingId);
+  const { data: row, error } = await sb.from('bookings').select('*').eq('id', bookingId).maybeSingle();
+  const booking = (row && !error) ? rowToBooking(row) : null;
 
   if(!booking){
     content.innerHTML = `
@@ -1457,8 +1480,8 @@ function closeCancelModal(){
 async function confirmCustomerCancel(bookingId){
   const digits = document.getElementById('cancelPhoneCheck').value.trim();
   const errEl = document.getElementById('cancelError');
-  const all = await storGet('bookings') || [];
-  const booking = all.find(b=>b.id===bookingId);
+  const { data: row, error } = await sb.from('bookings').select('*').eq('id', bookingId).maybeSingle();
+  const booking = (row && !error) ? rowToBooking(row) : null;
 
   if(!booking){
     errEl.textContent = 'Bu rezervasiya artıq tapılmadı.';
@@ -1471,9 +1494,8 @@ async function confirmCustomerCancel(bookingId){
     return;
   }
 
-  const updated = all.filter(b=>b.id!==bookingId);
-  await storSet('bookings', updated);
-  bookings = updated;
+  await sb.from('bookings').delete().eq('id', bookingId);
+  bookings = await fetchBookings();
 
   document.getElementById('cancelContent').innerHTML = `
     <p style="color:var(--laser); font-weight:700;">✓ Rezervasiyanız ləğv olundu.</p>
