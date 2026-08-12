@@ -1,22 +1,29 @@
 // Netlify Scheduled Function: /.netlify/functions/send-reminders
 // Hər gün avtomatik işə düşür, SABAHKI rezervasiyaları tapır və müştərilərə SMS xatırlatma göndərir.
 // Cədvəl netlify.toml-da təyin olunub (gündə bir dəfə, Bakı vaxtı ilə axşam).
+//
+// QEYD: bookings artıq öz cədvəlindədir (kv_store-dakı tək JSON blok deyil).
+// Hər rezervasiya "reminded" sahəsi öz sətrində, tək-tək YENİLƏNİR — bütün
+// siyahını oxuyub-dəyişib-geri-yazmır, ona görə admin panelində eyni anda
+// silmə/əlavə əməliyyatı ilə toqquşub bir-birini əzmə riski yoxdur.
 
 const SUPABASE_URL = 'https://pxmijumubqojaiapsect.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_kP3Q0Ung7ScsFNP2y9KEeQ_mZO24Doj'; // index.html-dəki ilə eyni ictimai anon açar
 
-async function getKV(key) {
+async function fetchTomorrowBookings(targetDate) {
   const res = await fetch(
-    `${SUPABASE_URL}/rest/v1/kv_store?key=eq.${encodeURIComponent(key)}&select=value`,
+    `${SUPABASE_URL}/rest/v1/bookings?date=eq.${targetDate}&reminded=eq.false&select=*`,
     { headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` } }
   );
-  if (!res.ok) return null;
-  const rows = await res.json();
-  return rows && rows[0] ? rows[0].value : null;
+  if (!res.ok) {
+    console.error('fetchTomorrowBookings failed', res.status, await res.text());
+    return [];
+  }
+  return res.json();
 }
 
-async function setKV(key, value) {
-  await fetch(`${SUPABASE_URL}/rest/v1/kv_store?key=eq.${encodeURIComponent(key)}`, {
+async function markReminded(id) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/bookings?id=eq.${encodeURIComponent(id)}`, {
     method: 'PATCH',
     headers: {
       apikey: SUPABASE_ANON_KEY,
@@ -24,8 +31,11 @@ async function setKV(key, value) {
       'Content-Type': 'application/json',
       Prefer: 'return=minimal'
     },
-    body: JSON.stringify({ value })
+    body: JSON.stringify({ reminded: true })
   });
+  if (!res.ok) {
+    console.error('markReminded failed', id, res.status, await res.text());
+  }
 }
 
 function tomorrowDateStr() {
@@ -63,27 +73,22 @@ exports.handler = async () => {
     return { statusCode: 500, body: 'Twilio konfiqurasiya olunmayıb.' };
   }
 
-  const bookings = (await getKV('bookings')) || [];
   const targetDate = tomorrowDateStr();
-  const toRemind = bookings.filter(b => b.date === targetDate && !b.reminded);
+  const toRemind = await fetchTomorrowBookings(targetDate);
 
   let sent = 0;
   let failed = 0;
 
   for (const b of toRemind) {
-    const msg = `Salam ${b.name}! Sabah saat ${b.time} RF Barber & Lazer-da "${b.serviceName}" (${b.barberName}) üçün rezervasiyanız var. Gözləyirik!`;
+    const msg = `Salam ${b.name}! Sabah saat ${b.time} RF Barber & Lazer-da "${b.service_name}" (${b.barber_name}) üçün rezervasiyanız var. Gözləyirik!`;
     try {
       await sendSms(b.phone, msg);
-      b.reminded = true;
+      await markReminded(b.id);
       sent++;
     } catch (e) {
       console.error('SMS göndərilmədi:', b.phone, e.message);
       failed++;
     }
-  }
-
-  if (sent > 0) {
-    await setKV('bookings', bookings);
   }
 
   console.log(`Xatırlatma tamamlandı: ${sent} göndərildi, ${failed} uğursuz, tarix: ${targetDate}`);
